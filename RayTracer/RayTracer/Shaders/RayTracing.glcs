@@ -1,0 +1,363 @@
+#version 430 core
+//This file handles the ray tracing using compute shaders
+
+//Definitions
+#define MAX_SCENE_BOUNDS 100
+#define NUM_SPHERE    4
+#define FLT_MAX       3.402823466e+38
+#define MatDiffuse    0
+#define MatMetal      1
+#define MatDielectric 2
+
+layout (local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0, rgba32f) uniform image2D destTex;
+uniform vec3 eye;
+uniform vec3 lower_left_corner;
+uniform vec3 vertical;
+uniform vec3 horizontal;
+
+//Utilities
+uint RNG(inout uint state)
+{
+    uint x = state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 15;
+    state = x;
+    return x;
+}
+
+float RandomFloat01(inout uint state)
+{
+    return (RNG(state) & 0xFFFFFF) / 16777216.0f;
+}
+
+bool Refract(vec3 v, vec3 n, float nint, out vec3 result)
+{
+  float dt = dot(v,n);
+  float discr = 1.0f - nint * nint * (1 - dt * dt);
+  if(discr > 0)
+  {
+    result = nint * (v-n *dt) - n * sqrt(discr);
+    return true;
+  }
+  return false;
+}
+
+float schlick(float cosine,  float ref_index)
+{
+  float r0 = (1 - ref_index)/ (1 + ref_index);
+  r0 = r0 * r0;
+  return r0 + (1-r0)*pow(clamp(1-cosine, 0.0, 1.0), 5);
+}
+
+vec3 RandomInUnitSphere(inout uint state)
+{
+  float z = RandomFloat01(state) * 2.0f - 1.0f;
+  float t = RandomFloat01(state) * 2.0f * 3.1415926f;
+  float r = sqrt(max(0.0, 1.0f - z * z));
+  float x = r * cos(t);
+  float y = r * sin(t);
+  vec3 res = vec3(x, y, z);
+  res *= pow(RandomFloat01(state), 1.0 / 3.0);
+
+  return res;
+}
+
+vec3 RandomUnitVector(inout uint state)
+{
+  float z = RandomFloat01(state) * 2.0f - 1.0f;
+  float a = RandomFloat01(state) * 2.0f * 3.1415926f;
+  float r = sqrt(1.0f - z * z);
+  float x = r * cos(a);
+  float y = r * sin(a);
+
+  return vec3(x, y, z);
+}
+
+struct Sphere
+{
+  vec3 center;
+  float radius;
+};
+
+struct HitInfo
+{
+  vec3 point;
+  vec3 normal;
+  float t;
+  int closestSphere;
+};
+
+struct Ray
+{
+  vec3 origin;
+  vec3 direction;
+};
+
+struct Camera
+{
+  vec3 origin;
+  vec3 lower_left_corner;
+  vec3 horizontal;
+  vec3 vertical;
+};
+
+Camera CreateCamera(vec3 eye, vec3 lookat, vec3 vup, float vfov, float aspect)
+{
+  Camera c;
+  c.origin = eye;
+  vec3 u ,v, w;
+
+  float theta = vfov * (3.14159265359f / 180.0f);
+  float half_height = tan(theta/2);
+  float half_width = aspect * half_height;
+
+  w = normalize(eye - lookat);
+  u = normalize(cross(vup, w));
+  v = cross(w,u);
+
+  c.lower_left_corner = eye - half_width * u - half_height * v - w;
+
+  c.horizontal = 2 * half_width * u;
+  c.vertical = 2 * half_height * v;
+  return c;
+}
+
+Ray GetRay(Camera c, float s, float t)
+{
+  Ray r;
+  r.origin = c.origin;
+  r.direction = c.lower_left_corner + s * c.horizontal + t * c.vertical - c.origin;
+
+  return r;
+}
+
+Ray MakeRay(vec3 origin, vec3 direction)
+{
+  Ray r;
+  r.origin = origin;
+  r.direction = direction;
+
+  return r;
+}
+
+vec3 PointAt(Ray r, float t)
+{
+  return r.origin + r.direction * t;
+}
+
+struct Material
+{
+  int type;
+  vec3 albedo;
+  float roughness;
+  float refIndex;
+};
+
+const Sphere spheres[] = { {vec3(0,0,-1), 0.5f}, {vec3(0,-100.5,-1), 100.0f}, {vec3(1.2, 0,-1), 0.5f}, {vec3(-1.2,0,-1), 0.5f}  };
+const Material materials[] = {{MatMetal, vec3(0.7,0.3,0.3), 0.0f, 0.0f}, {MatDiffuse, vec3(0.8f,0.8f,0), 1.0f, 0.0f},
+{MatMetal, vec3(0.8f,0.6f,0.2f), 0.0f, 0.0f}, {MatDielectric, vec3(1.0f,1.0f,1.0f), 0.0f, 2.0f} };
+
+bool RaySphere(Ray r, Sphere s, float tmin, float tmax, inout  HitInfo rec)
+{
+  vec3 oc = r.origin - s.center;
+  float a = dot(r.direction, r.direction);
+  float half_b = dot(oc, r.direction);
+  float c = dot(oc, oc) - s.radius * s. radius;
+  float discrim = half_b * half_b - a * c;
+
+  if(discrim > 0)
+  {
+    float root = sqrt(discrim);
+    float temp = (-half_b - root) / a;
+
+    if(temp < tmax && temp > tmin)
+    {
+      rec.t = temp;
+      rec.point = PointAt(r, temp);
+      rec.normal = (rec.point - s.center) / s.radius;
+
+      if(dot(rec.normal, r.direction) >= 0)
+      {
+        rec.normal = -rec.normal;
+      }
+
+      return true;
+    }
+
+    temp = (-half_b + root) / a;
+
+    if(temp < tmax && temp > tmin)
+    {
+      rec.t = temp;
+      rec.point = PointAt(r, temp);
+      rec.normal = (rec.point - s.center) / s.radius;
+
+      if(dot(rec.normal, r.direction) >= 0)
+      {
+        rec.normal = -rec.normal;
+      }
+
+      return true;
+    }
+
+  }
+
+  return false;
+}
+
+bool RaySpheres(Ray r, float tmin, float tmax, inout  HitInfo rec)
+{
+  HitInfo temp_rec;
+  bool hasHit = false;
+  float closestSoFar = tmax;
+
+  for(int i = 0; i < NUM_SPHERE; ++i)
+  {
+    if(RaySphere(r, spheres[i], tmin, closestSoFar, temp_rec))
+    {
+      hasHit = true;
+      closestSoFar = temp_rec.t;
+      rec = temp_rec;
+      rec.closestSphere = i;
+    }
+  }
+
+  return hasHit;
+}
+
+bool Scattered(Ray r, in HitInfo rec, inout vec3 attenuation, inout Ray scattered, inout uint state )
+{
+  Material currMat = materials[rec.closestSphere];
+
+  if(currMat.type == MatDiffuse)
+  {
+    vec3 dir = rec.normal +  RandomInUnitSphere(state);
+    scattered = MakeRay(rec.point, dir);
+    attenuation = currMat.albedo;
+    return true;
+  }
+  else if(currMat.type == MatMetal)
+  {
+    vec3 reflected = reflect(normalize(r.direction), rec.normal);
+    scattered = MakeRay(rec.point, reflected + currMat.roughness * RandomInUnitSphere(state));
+    attenuation = currMat.albedo;
+    return (dot(scattered.direction, rec.normal) > 0);
+  }
+  else if(currMat.type == MatDielectric)
+  {
+    attenuation = vec3(1.0f, 1.0f, 1.0f);
+    vec3 rdir = r.direction;
+    vec3 reflected = reflect(rdir, normalize(rec.normal));
+    float nint;
+    vec3 refracted;
+    vec3 outwardNorm;
+    float reflectProb;
+    float cosine;
+    
+
+    if(dot(rdir, rec.normal) > 0)
+    {
+      outwardNorm = -rec.normal;
+      nint = currMat.refIndex;
+      cosine = currMat.refIndex * dot(rdir, rec.normal);
+    }
+    else
+    {
+      outwardNorm = rec.normal;
+      nint = 1.0 / currMat.refIndex;
+      cosine = -dot(rdir, rec.normal);
+    }
+
+    if(Refract(rdir, outwardNorm, nint, refracted))
+    {
+      reflectProb = schlick(cosine, currMat.refIndex);
+    }
+    else
+    {
+      reflectProb = 1;
+    }
+
+    if(RandomFloat01(state) < reflectProb)
+    {
+      scattered = MakeRay(rec.point, normalize(reflected));
+    }
+    else
+    {
+      scattered = MakeRay(rec.point, normalize(refracted));
+    }
+    return true;
+  }
+
+  //Invalid material found
+  return false;
+}
+
+vec3 RayTracing(Ray r,inout uint state)
+{
+  Ray cur_ray = r;
+  vec3 curr_attenuation = vec3(1.0f, 1.0f, 1.0f);
+
+  for(int i = 0; i < 50; ++i)
+  {
+    HitInfo record;
+    if(RaySpheres(cur_ray, 0.001f, FLT_MAX, record))
+    {
+      Ray scattered;
+      vec3 attenuation;
+
+      if(Scattered(cur_ray, record, attenuation, scattered, state))
+      {
+        cur_ray = scattered;
+        curr_attenuation = curr_attenuation * attenuation;
+      }
+    }
+    else
+    {
+      vec3 unitRayDir = normalize(cur_ray.direction);
+      float t = 0.5f * (unitRayDir.y + 1.0f);
+      vec3 c = (1.0f - t) * vec3(1.0f,1.0f,1.0f) + t*vec3(0.5f,0.7f,1.0f);
+      return c * curr_attenuation;
+    }
+  }
+
+  return vec3(0,0,0);
+}
+
+void main() 
+{
+  //Default color for the image
+  vec4 pixel = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+
+  //Get the index in the global work group
+  ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 img_size = imageSize(destTex);
+
+  uint rngState = (pixel_coords.x * 1973 + pixel_coords.y * 9277 + 30 * 26699) | 1;
+
+  //main code
+  float fx = float(pixel_coords.x);
+  float fy = float(pixel_coords.y);
+
+  float aspect_ratio = float(img_size.x) / img_size.y;
+  Camera c = CreateCamera(eye, vec3(0,0,-1), vec3(0,1,0), 90, aspect_ratio);
+
+  for(int s=0; s < 50; s++) 
+  {
+      float u = (fx + RandomFloat01(rngState)) / img_size.x;
+      float v = (fy + RandomFloat01(rngState)) / img_size.y;
+
+      Ray r = GetRay(c, u, v);
+  
+      pixel += vec4(RayTracing(r, rngState), 1.0f);
+  }
+  
+  pixel /= float(50);
+  pixel.x = sqrt(pixel.x);
+  pixel.y = sqrt(pixel.y);
+  pixel.z = sqrt(pixel.z);
+
+  //output to a specific pixel in the image
+  imageStore(destTex, pixel_coords, pixel);
+}
